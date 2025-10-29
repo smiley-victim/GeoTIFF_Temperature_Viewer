@@ -446,6 +446,6 @@ Built with ❤️ by **IG DRONES** for professional thermal analysis.
 
 *Professional thermal analysis made simple*
 
-[⬆ Back to top](#)
+[⬆ Back to top](#top)
 
 </div>
