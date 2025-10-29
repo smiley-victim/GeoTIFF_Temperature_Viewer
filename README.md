@@ -446,6 +446,6 @@ Built with ❤️ by **IG DRONES** for professional thermal analysis.
 
 *Professional thermal analysis made simple*
 
-[⬆ Back to top](#-ig-drones-geotiff-temperature-viewer)
+[⬆ Back to top](#)
 
 </div>
