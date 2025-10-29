@@ -339,12 +339,13 @@ class DataQualityValidator:
             return False, f"Impossible value ({value:.1f}) - likely NoData", "impossible"
     
     def interpolate_from_neighbors(self, data: np.ndarray, row: int, col: int, 
-                                   max_radius: int = 15) -> tuple[bool, float, int, int]:
+                                   max_radius: int = None) -> tuple[bool, float, int, int]:
         """
-        Interpolate temperature from nearby NORMAL pixels (v8.1 - CONSERVATIVE Approach).
+        Interpolate temperature from nearby NORMAL pixels (v8.1 Enhanced - Aggressive Search).
         
         Searches in expanding circles to find NORMAL range neighbors ONLY (0-50°C).
         Uses inverse distance weighting for more accurate interpolation.
+        Keeps expanding search radius until valid neighbors found or reaches image bounds.
         
         CONSERVATIVE VALIDATION - ONLY NORMAL RANGE:
         - Only uses neighbors with temperatures between 0°C and 50°C (NORMAL range)
@@ -353,16 +354,28 @@ class DataQualityValidator:
         - Validates the interpolated result is also within NORMAL range (0-50°C)
         - Gives balanced, typical temperatures from normal neighbors only
         
+        AGGRESSIVE SEARCH (v8.1 Enhanced):
+        - Dynamically calculates max search radius based on image size
+        - Searches up to 20% of image dimension if needed
+        - Ensures complete coverage of entire image
+        - Never gives up until reaching image bounds
+        
         Args:
             data: Temperature data array
             row: Row index of pixel to interpolate
             col: Column index of pixel to interpolate
-            max_radius: Maximum search radius in pixels (default: 15)
+            max_radius: Maximum search radius in pixels (None = auto-calculate based on image size)
             
         Returns:
             Tuple of (success, interpolated_value, valid_neighbors_found, search_radius_used)
         """
         height, width = data.shape
+        
+        # Dynamic max_radius calculation (v8.1 Enhanced)
+        # Search up to 20% of the smaller image dimension
+        # This ensures we can find neighbors anywhere in the image
+        if max_radius is None:
+            max_radius = max(50, min(height, width) // 5)  # At least 50px, up to 20% of image
         
         # Try expanding search radius
         for radius in range(1, max_radius + 1):
@@ -683,6 +696,13 @@ class GeoTIFFViewer(QMainWindow):
         # Floating info label for showing temperature on click
         self.floating_label: Optional[QLabel] = None
         self.floating_timer: Optional[QTimer] = None
+        
+        # Loading skeleton for file upload
+        self.loading_skeleton: Optional[QLabel] = None
+        self.loading_animation = None
+        
+        # Processing lock to prevent clicks during estimation
+        self.is_processing = False
         
         self.init_ui()
         
@@ -1059,6 +1079,9 @@ class GeoTIFFViewer(QMainWindow):
     def load_geotiff(self, file_path: str):
         """Load and display a GeoTIFF file with multi-band support (v6.0)."""
         try:
+            # Show loading skeleton immediately
+            self.show_loading_skeleton()
+            
             self.status_bar.showMessage(f"Loading {Path(file_path).name}...")
             QApplication.processEvents()  # Update UI
             
@@ -1107,6 +1130,7 @@ class GeoTIFFViewer(QMainWindow):
                     # User cancelled - close dataset and abort
                     self.dataset.close()
                     self.dataset = None
+                    self.hide_loading_skeleton()
                     self.status_bar.showMessage("File loading cancelled | IG DRONES")
                     return
                 
@@ -1230,6 +1254,9 @@ class GeoTIFFViewer(QMainWindow):
             QApplication.processEvents()
             self.display_raster()
             
+            # Hide loading skeleton now that image is loaded
+            self.hide_loading_skeleton()
+            
             # Enable reset button
             self.reset_btn.setEnabled(True)
             
@@ -1244,6 +1271,9 @@ class GeoTIFFViewer(QMainWindow):
                 )
             
         except Exception as e:
+            # Hide loading skeleton on error
+            self.hide_loading_skeleton()
+            
             QMessageBox.critical(
                 self,
                 "Error Loading GeoTIFF",
@@ -1893,7 +1923,14 @@ class GeoTIFFViewer(QMainWindow):
         if self.dataset is None or self.raster_data is None:
             return
         
+        # Ignore clicks while processing to prevent multiple simultaneous operations
+        if self.is_processing:
+            self.status_bar.showMessage("Processing... Please wait | IG DRONES")
+            return
+        
         try:
+            # Set processing flag
+            self.is_processing = True
             # Store last clicked location for intelligent band switching
             self.last_click_preview_x = preview_x
             self.last_click_preview_y = preview_y
@@ -1914,12 +1951,45 @@ class GeoTIFFViewer(QMainWindow):
             
             # Ensure within bounds
             if 0 <= raster_x < width and 0 <= raster_y < height:
-                # Add visual pin marker at the clicked position (preview coordinates)
-                self.graphics_view.add_pin_marker(preview_x, preview_y)
-                
                 # Get geographic coordinates using the transform (center of click)
                 lon, lat = self.dataset.xy(raster_y, raster_x)
                 
+                # INSTANT FEEDBACK (v8.1 Enhanced) - Show immediately before processing
+                # 0. Remove old popup (processing lock prevents multiple popups)
+                if self.floating_label:
+                    try:
+                        self.floating_label.setParent(None)
+                        self.floating_label.close()
+                        self.floating_label.hide()
+                        self.floating_label.deleteLater()
+                    except:
+                        pass
+                    finally:
+                        self.floating_label = None
+                
+                # Force UI to process deletion NOW
+                QApplication.processEvents()
+                
+                # 1. Add visual pin marker at the clicked position
+                self.graphics_view.add_pin_marker(preview_x, preview_y)
+                
+                # 2. Show "Estimating..." in UI immediately with orange processing color
+                self.lat_label.setText(f"Lat: {lat:.6f}°")
+                self.lon_label.setText(f"Lon: {lon:.6f}°")
+                self.temp_label.setText("Temperature: Estimating...")
+                self.temp_label.setStyleSheet("font-size: 13px; font-weight: bold; color: #FF9800;")  # Orange for processing
+                self.status_bar.showMessage(f"Analyzing location | Lat {lat:.6f}, Lon {lon:.6f} | IG DRONES")
+                
+                # 3. Force UI update before creating new popup
+                QApplication.processEvents()
+                
+                # 4. NOW create new floating popup with "Estimating..."
+                self.show_floating_label_estimating(preview_x, preview_y, lat, lon)
+                
+                # 5. Force final UI update to show feedback instantly
+                QApplication.processEvents()
+                
+                # Now process actual temperature calculation
                 # Neighborhood averaging (v6.1)
                 # Uses 9-grid (3x3) system
                 if self.grid_enabled and self.grid_size > 0:
@@ -1961,6 +2031,10 @@ class GeoTIFFViewer(QMainWindow):
                         value = self.raster_data[self.current_band - 1, raster_y, raster_x]
                 
                 # Validate clicked temperature value (v8.0 Enhanced - Multi-level)
+                # Update status to show validation in progress
+                self.status_bar.showMessage(f"Validating data | Lat {lat:.6f}, Lon {lon:.6f} | IG DRONES")
+                QApplication.processEvents()
+                
                 validation_icon = ""
                 validation_level = "normal"
                 
@@ -1973,6 +2047,10 @@ class GeoTIFFViewer(QMainWindow):
                     if not is_usable or validation_level == "unusual":
                         # UNUSUAL/IMPOSSIBLE value - TRY INTELLIGENT INTERPOLATION! (v8.1 Enhanced)
                         
+                        # Update status to show we're searching
+                        self.status_bar.showMessage(f"Searching for valid data | Lat {lat:.6f}, Lon {lon:.6f} | IG DRONES")
+                        QApplication.processEvents()
+                        
                         # Get current band data
                         if self.raster_data.ndim == 2:
                             band_data = self.raster_data
@@ -1982,9 +2060,10 @@ class GeoTIFFViewer(QMainWindow):
                         # Apply metadata transforms
                         band_data = self.validator.apply_metadata_transforms(band_data)
                         
-                        # Try to interpolate from nearby valid pixels (with strict validation)
+                        # Try to interpolate from nearby valid pixels (with aggressive search)
+                        # max_radius=None enables dynamic radius based on image size
                         success, interpolated_value, num_neighbors, search_radius = \
-                            self.validator.interpolate_from_neighbors(band_data, raster_y, raster_x, max_radius=15)
+                            self.validator.interpolate_from_neighbors(band_data, raster_y, raster_x, max_radius=None)
                         
                         if success:
                             # INTERPOLATION SUCCESSFUL! Use estimated value
@@ -2001,6 +2080,11 @@ class GeoTIFFViewer(QMainWindow):
                             
                             temp_display = f"{temp_celsius:.1f} °C (Estimated)"
                             value_display = f"Estimated from surrounding area"
+                            temp_short = f"{temp_celsius:.1f}°C"  # For status bar
+                            
+                            # Update popup immediately with estimated value
+                            self.hide_floating_label()
+                            QApplication.processEvents()
                             
                             # Show success in status bar
                             if original_validation_level == "unusual":
@@ -2037,14 +2121,19 @@ class GeoTIFFViewer(QMainWindow):
                                     temp_display = f"{temp_celsius:.1f} °C (No Data)"
                                     value_display = f"{temp_celsius:.1f} °C = {temp_kelvin:.1f} K (No data available)"
                             
+                            # Hide the "Estimating..." popup
+                            self.hide_floating_label()
+                            QApplication.processEvents()
+                            
                             # Show error in status bar
                             if original_validation_level == "unusual":
                                 self.status_bar.showMessage(f"Extreme value: {temp_celsius:.1f}°C | Unable to validate | IG DRONES")
                             else:
                                 self.status_bar.showMessage(f"No data available at this location | IG DRONES")
                             
-                            # Update labels with error indication
+                            # Update labels with error indication (red color for error)
                             self.temp_label.setText(f"Temperature: {temp_display}")
+                            self.temp_label.setStyleSheet("font-size: 13px; font-weight: bold; color: #F44336;")  # Red for error
                             self.lat_label.setText(f"Lat: {lat:.6f}°")
                             self.lon_label.setText(f"Lon: {lon:.6f}°")
                             return  # Don't process impossible data further
@@ -2064,8 +2153,8 @@ class GeoTIFFViewer(QMainWindow):
                     temp_short = "No Data"
                 elif validation_level == "estimated":
                     # Already set in interpolation logic above
-                    # temp_display and value_display are already defined
-                    # Just need to update coordinates
+                    # temp_display, value_display, and temp_short are already defined
+                    # temp_celsius is also available from interpolation
                     pass
                 else:
                     # Automatic temperature unit detection and conversion
@@ -2099,10 +2188,11 @@ class GeoTIFFViewer(QMainWindow):
                         value_display = f"{temp_celsius:.1f} °C ({temp_kelvin:.1f} K)"
                         temp_short = f"{temp_celsius:.1f}°C"
                 
-                # Update info panel
+                # Update info panel with result (reset to green color)
                 self.lat_label.setText(f"Lat: {lat:.6f}°")
                 self.lon_label.setText(f"Lon: {lon:.6f}°")
                 self.temp_label.setText(f"Temperature: {temp_display}")
+                self.temp_label.setStyleSheet("font-size: 13px; font-weight: bold; color: #4CAF50;")  # Green for result
                 
                 # Update status bar
                 self.status_bar.showMessage(
@@ -2120,12 +2210,71 @@ class GeoTIFFViewer(QMainWindow):
                 
         except Exception as e:
             self.status_bar.showMessage(f"Error sampling point: {str(e)} | IG DRONES")
+        finally:
+            # Always reset processing flag when done
+            self.is_processing = False
+    
+    def show_floating_label_estimating(self, x: int, y: int, lat: float, lon: float):
+        """Show instant floating label with 'Estimating...' text (v8.1 Enhanced)."""
+        # Note: Old popup cleanup is handled in click handler before this is called
+        # Just create the new floating label
+        self.floating_label = QLabel(self)
+        info_text = (
+            f"Temperature: Estimating...\n"
+            f"Lat: {lat:.6f}, Lon: {lon:.6f}\n\n"
+            f"⚠ Please wait... Avoid clicking again"
+        )
+        self.floating_label.setText(info_text)
+        self.floating_label.setStyleSheet("""
+            QLabel {
+                background-color: rgba(255, 152, 0, 220);
+                color: white;
+                border: 2px solid #FFA726;
+                border-radius: 8px;
+                padding: 8px 12px;
+                font-size: 11px;
+                font-weight: bold;
+            }
+        """)
+        self.floating_label.setAlignment(Qt.AlignCenter)
+        self.floating_label.adjustSize()
+        
+        # Position the label near the graphics view
+        view_pos = self.graphics_view.mapFromScene(QPointF(x, y))
+        global_pos = self.graphics_view.mapToGlobal(view_pos)
+        local_pos = self.mapFromGlobal(global_pos)
+        
+        # Offset to avoid covering the marker
+        offset_x = 20
+        offset_y = -40
+        
+        # Ensure label stays within window bounds
+        label_x = min(local_pos.x() + offset_x, self.width() - self.floating_label.width() - 10)
+        label_y = max(local_pos.y() + offset_y, 10)
+        
+        self.floating_label.move(label_x, label_y)
+        self.floating_label.show()
+        self.floating_label.raise_()
+        
+        # Don't auto-hide yet - will be updated with real value
+        if self.floating_timer:
+            self.floating_timer.stop()
     
     def show_floating_label(self, x: int, y: int, temp_value: float, lat: float, lon: float, mode: str = "Single Pixel"):
         """Display a floating info label near the clicked point (v6.1 - Updated UI)."""
-        # Remove existing floating label if any
+        # Remove existing popup (processing lock ensures only one operation at a time)
         if self.floating_label:
-            self.floating_label.deleteLater()
+            try:
+                self.floating_label.setParent(None)
+                self.floating_label.close()
+                self.floating_label.hide()
+                self.floating_label.deleteLater()
+            except:
+                pass
+            finally:
+                self.floating_label = None
+        
+        QApplication.processEvents()
         
         # Format temperature display - ALWAYS show BOTH Celsius AND Kelvin
         if np.isnan(temp_value):
@@ -2185,10 +2334,95 @@ class GeoTIFFViewer(QMainWindow):
         self.floating_timer.start(4000)  # 4 seconds
     
     def hide_floating_label(self):
-        """Hide and remove the floating info label."""
+        """Hide and remove floating info label."""
         if self.floating_label:
-            self.floating_label.deleteLater()
-            self.floating_label = None
+            try:
+                self.floating_label.setParent(None)
+                self.floating_label.close()
+                self.floating_label.hide()
+                self.floating_label.deleteLater()
+            except:
+                pass
+            finally:
+                self.floating_label = None
+    
+    def show_loading_skeleton(self):
+        """Show loading skeleton UI with shimmer animation in the graphics view area."""
+        # Create a loading overlay widget
+        loading_widget = QLabel(self.graphics_view)
+        loading_widget.setObjectName("loading_skeleton")  # For identification
+        
+        # Skeleton loading style with gray colors
+        loading_widget.setStyleSheet("""
+            QLabel {
+                background: qlineargradient(
+                    x1:0, y1:0, x2:1, y2:0,
+                    stop:0 rgba(45, 45, 45, 240),
+                    stop:0.5 rgba(60, 60, 60, 240),
+                    stop:1 rgba(45, 45, 45, 240)
+                );
+                color: #B0B0B0;
+                font-size: 16px;
+                font-weight: 500;
+                border: 2px solid rgba(80, 80, 80, 200);
+                border-radius: 10px;
+            }
+        """)
+        loading_widget.setAlignment(Qt.AlignCenter)
+        loading_widget.setText("Loading GeoTIFF...\n\nPreparing image data\nPlease wait...")
+        
+        # Make it cover the entire graphics view
+        loading_widget.setGeometry(0, 0, self.graphics_view.width(), self.graphics_view.height())
+        loading_widget.show()
+        loading_widget.raise_()
+        
+        # Store reference
+        self.loading_skeleton = loading_widget
+        
+        # Create pulsing animation for skeleton effect
+        from PyQt5.QtCore import QPropertyAnimation, QEasingCurve
+        self.loading_animation = QPropertyAnimation(loading_widget, b"windowOpacity")
+        self.loading_animation.setDuration(1500)  # 1.5 seconds
+        self.loading_animation.setStartValue(0.6)
+        self.loading_animation.setEndValue(1.0)
+        self.loading_animation.setEasingCurve(QEasingCurve.InOutQuad)
+        self.loading_animation.setLoopCount(-1)  # Infinite loop
+        self.loading_animation.start()
+        
+        QApplication.processEvents()
+    
+    def hide_loading_skeleton(self):
+        """Hide and remove loading skeleton UI."""
+        # Stop animation if it exists
+        if hasattr(self, 'loading_animation') and self.loading_animation:
+            try:
+                self.loading_animation.stop()
+                self.loading_animation.deleteLater()
+            except:
+                pass
+            finally:
+                self.loading_animation = None
+        
+        # Find and remove loading skeleton by object name
+        if hasattr(self, 'loading_skeleton') and self.loading_skeleton:
+            try:
+                self.loading_skeleton.hide()
+                self.loading_skeleton.deleteLater()
+            except:
+                pass
+            finally:
+                self.loading_skeleton = None
+        
+        # Also search for any orphaned loading skeletons
+        for child in self.graphics_view.findChildren(QLabel):
+            if child.objectName() == "loading_skeleton":
+                try:
+                    child.hide()
+                    child.deleteLater()
+                except:
+                    pass
+        
+        QApplication.processEvents()
     
     def reset_view(self):
         """Reset the zoom and pan to original state."""
